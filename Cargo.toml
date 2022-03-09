@@ -1,0 +1,10 @@
+[package]
+name = "rust-gpu-wgpu-compute-minimal"
+version = "0.1.0"
+edition = "2021"
+authors = ["Andrew Korzhuev <korzhuev@andrusha.me>"]
+description = "Minimal rust-gpu compute shader example running on WGPU backend with Vulkan support"
+keywords = ["rust-gpu", "wgpu", "compute-shader", "vulkan"]
+
+
+[dependencies]
