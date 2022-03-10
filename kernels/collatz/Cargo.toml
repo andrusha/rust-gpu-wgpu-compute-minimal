@@ -1,0 +1,10 @@
+[package]
+name = "collatz"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["dylib", "lib"]
+
+[dependencies]
+spirv-std = { git = "https://github.com/EmbarkStudios/rust-gpu", features = ["glam"] }

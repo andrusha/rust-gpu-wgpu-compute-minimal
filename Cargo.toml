@@ -8,3 +8,8 @@ keywords = ["rust-gpu", "wgpu", "compute-shader", "vulkan"]
 
 
 [dependencies]
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+wgpu = { git = "https://github.com/gfx-rs/wgpu", features = ["spirv", "vulkan-portability"] }
+
+[build-dependencies]
+spirv-builder = { git = "https://github.com/EmbarkStudios/rust-gpu" }
