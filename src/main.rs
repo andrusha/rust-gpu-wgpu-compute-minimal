@@ -1,11 +1,9 @@
 use wgpu::util::DeviceExt;
 
-use futures::future::join;
-use std::{convert::TryInto, num::NonZeroU64, time::Duration};
+use std::{convert::TryInto, num::NonZeroU64};
+use wgpu::{BufferAsyncError, Device, Queue, RequestDeviceError, ShaderModule};
 
-pub async fn start_internal(
-    shader_binary: wgpu::ShaderModuleDescriptorSpirV<'static>,
-) {
+async fn init_device() -> Result<(Device, Queue), RequestDeviceError> {
     let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -16,7 +14,7 @@ pub async fn start_internal(
         .await
         .expect("Failed to find an appropriate adapter");
 
-    let (device, queue) = adapter
+    adapter
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
@@ -25,24 +23,24 @@ pub async fn start_internal(
                 limits: wgpu::Limits::default(),
             },
             None,
-        )
-        .await
-        .expect("Failed to create device");
-    drop(instance);
-    drop(adapter);
+        ).await
+}
 
-    let timestamp_period = queue.get_timestamp_period();
+fn load_collatz_shader_module(device: &Device) -> ShaderModule {
+    let shader_bytes: &[u8] = include_bytes!(env!("collatz.spv"));
+    let spirv = std::borrow::Cow::Owned(wgpu::util::make_spirv_raw(shader_bytes).into_owned());
+    let shader_binary = wgpu::ShaderModuleDescriptorSpirV {
+        label: None,
+        source: spirv,
+    };
 
     // Load the shaders from disk
-    let module = unsafe { device.create_shader_module_spirv(&shader_binary) };
+    unsafe { device.create_shader_module_spirv(&shader_binary) }
+}
 
-    let top = 2u32.pow(20);
-    let src_range = 1..top;
-
-    let src = src_range
-        .clone()
-        .flat_map(u32::to_ne_bytes)
-        .collect::<Vec<_>>();
+async fn run_collatz_shader(input: &[u8]) -> Result<Vec<u32>, BufferAsyncError> {
+    let (device, queue) = init_device().await.expect("Failed to create device");
+    let module = load_collatz_shader_module(&device);
 
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
@@ -77,7 +75,7 @@ pub async fn start_internal(
 
     let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: src.len() as wgpu::BufferAddress,
+        size: input.len() as wgpu::BufferAddress,
         // Can be read to the CPU, and can be copied from the shader's storage buffer
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -85,19 +83,11 @@ pub async fn start_internal(
 
     let storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Collatz Conjecture Input"),
-        contents: &src,
+        contents: input,
         usage: wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC,
     });
-
-    let timestamp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Timestamps buffer"),
-        size: 16,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: true,
-    });
-    timestamp_buffer.unmap();
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -108,12 +98,6 @@ pub async fn start_internal(
         }],
     });
 
-    let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
-        label: None,
-        count: 2,
-        ty: wgpu::QueryType::Timestamp,
-    });
-
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
@@ -121,9 +105,7 @@ pub async fn start_internal(
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.set_pipeline(&compute_pipeline);
-        cpass.write_timestamp(&queries, 0);
-        cpass.dispatch(src_range.len() as u32 / 64, 1, 1);
-        cpass.write_timestamp(&queries, 1);
+        cpass.dispatch(input.len() as u32 / 64, 1, 1);
     }
 
     encoder.copy_buffer_to_buffer(
@@ -131,32 +113,35 @@ pub async fn start_internal(
         0,
         &readback_buffer,
         0,
-        src.len() as wgpu::BufferAddress,
+        input.len() as wgpu::BufferAddress,
     );
-    encoder.resolve_query_set(&queries, 0..2, &timestamp_buffer, 0);
 
     queue.submit(Some(encoder.finish()));
     let buffer_slice = readback_buffer.slice(..);
-    let timestamp_slice = timestamp_buffer.slice(..);
-    let timestamp_future = timestamp_slice.map_async(wgpu::MapMode::Read);
     let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
     device.poll(wgpu::Maintain::Wait);
 
-    if let (Ok(()), Ok(())) = join(buffer_future, timestamp_future).await {
-        let data = buffer_slice.get_mapped_range();
-        let timing_data = timestamp_slice.get_mapped_range();
-        let result = data
-            .chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let timings = timing_data
-            .chunks_exact(8)
-            .map(|b| u64::from_ne_bytes(b.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        drop(data);
-        readback_buffer.unmap();
-        drop(timing_data);
-        timestamp_buffer.unmap();
+    buffer_future.await?;
+
+    let data = buffer_slice.get_mapped_range();
+    let result = data
+        .chunks_exact(4)
+        .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+        .collect::<Vec<_>>();
+
+    Ok(result)
+}
+
+async fn collatz() {
+    let top = 2u32.pow(20);
+    let src_range = 1..top;
+
+    let src = src_range
+        .clone()
+        .flat_map(u32::to_ne_bytes)
+        .collect::<Vec<_>>();
+
+    if let Ok(result) = run_collatz_shader(&src).await {
         let mut max = 0;
         for (src, out) in src_range.zip(result.iter().copied()) {
             if out == u32::MAX {
@@ -168,25 +153,9 @@ pub async fn start_internal(
                 println!("{}: {}", src, out);
             }
         }
-        println!(
-            "Took: {:?}",
-            Duration::from_nanos(
-                ((timings[1] - timings[0]) as f64 * f64::from(timestamp_period)) as u64
-            )
-        );
     }
 }
 
-const KERNEL: &[u8] = include_bytes!(env!("collatz.spv"));
-
 fn main() {
-    let spirv = std::borrow::Cow::Owned(wgpu::util::make_spirv_raw(KERNEL).into_owned());
-    let shader_binary = wgpu::ShaderModuleDescriptorSpirV {
-        label: None,
-        source: spirv,
-    };
-
-    futures::executor::block_on(start_internal(shader_binary));
-
-    println!("Hello, world!");
+    futures::executor::block_on(collatz());
 }
