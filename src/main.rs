@@ -121,15 +121,13 @@ async fn run_collatz_shader(input: &[u8]) -> Result<Vec<u32>, BufferAsyncError> 
     let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
     device.poll(wgpu::Maintain::Wait);
 
-    buffer_future.await?;
-
-    let data = buffer_slice.get_mapped_range();
-    let result = data
-        .chunks_exact(4)
-        .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
-        .collect::<Vec<_>>();
-
-    Ok(result)
+    buffer_future.await.map(|_| {
+        buffer_slice
+            .get_mapped_range()
+            .chunks_exact(4)
+            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    })
 }
 
 async fn collatz() {
